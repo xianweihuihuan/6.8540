@@ -1,0 +1,8 @@
+=== RUN   TestOneClientReliable
+Test: 1 lock clients (reliable network)...
+  ... Passed --  time  2.0s #peers 1 #RPCs  1261 #Ops    0
+--- PASS: TestOneClientReliable (2.00s)
+=== RUN   TestManyClientsReliable
+Test: 10 lock clients (reliable network)...
+exit status 1
+FAIL	6.5840/kvsrv1/lock	3.076s
