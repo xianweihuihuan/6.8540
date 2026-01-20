@@ -44,10 +44,8 @@ type Raft struct {
 	me        int                 // 该节点在 peers[] 数组中的索引。
 	dead      int32               // set by Kill()
 
-	cond            *sync.Cond
-	applyCh         chan raftapi.ApplyMsg
-	snapshotData    []byte // 暂存待应用的快照
-	pendingSnapshot bool   // 标志位
+	cond    *sync.Cond
+	applyCh chan raftapi.ApplyMsg
 
 	// 在此处存放你的数据（3A、3B、3C）。
 	// 查看论文的图 2，以了解 Raft 服务器必须维护的状态。
@@ -197,10 +195,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	// 3. 更新 snapshot 元数据
 	rf.lastIncludeIndex = args.LastIncludeIndex
 	rf.lastIncludeTerm = args.LastIncludeTerm
-	
-	rf.snapshotData = args.Data
-	rf.pendingSnapshot = true
-	
+
 	// 4. 推进 commitIndex / lastApplied
 	rf.commitIndex = max(rf.commitIndex, rf.lastIncludeIndex)
 	rf.lastApplied = max(rf.lastApplied, rf.lastIncludeIndex)
@@ -220,10 +215,14 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.persister.Save(raftstate, args.Data)
 
 	// 6. 通知上层
-	rf.cond.Broadcast()
+	rf.applyCh <- raftapi.ApplyMsg{
+		SnapshotValid: true,
+		Snapshot:      args.Data,
+		SnapshotTerm:  rf.lastIncludeTerm,
+		SnapshotIndex: rf.lastIncludeIndex,
+	}
 	rf.mu.Unlock()
-
-
+	
 }
 
 // 服务（上层应用）表示它已经创建了一个快照（snapshot），
@@ -263,13 +262,6 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	}
 	raftstate := w.Bytes()
 	rf.persister.Save(raftstate, snapshot)
-
-	if rf.commitIndex < rf.lastIncludeIndex {
-		rf.commitIndex = rf.lastIncludeIndex
-	}
-	if rf.lastApplied < rf.lastIncludeIndex {
-		rf.lastApplied = rf.lastIncludeIndex
-	}
 }
 
 // 示例 RequestVote RPC 参数结构体。
@@ -748,138 +740,34 @@ func (rf *Raft) startElection() {
 	}
 }
 
-// func (rf *Raft) applier() {
-// 	for !rf.killed() {
-// 		rf.mu.Lock()
-// 		for rf.commitIndex <= rf.lastApplied {
-// 			rf.cond.Wait()
-// 			if rf.killed() {
-// 				rf.mu.Unlock()
-// 				return
-// 			}
-// 		}
-// 		if rf.lastApplied < rf.lastIncludeIndex {
-// 			rf.lastApplied = rf.lastIncludeIndex
-// 		}
-// 		if rf.commitIndex <= rf.lastApplied {
-// 			rf.mu.Unlock()
-// 			continue
-// 		}
-// 		low := rf.lastApplied + 1
-// 		high := rf.commitIndex
-// 		if low > high {
-// 			rf.mu.Unlock()
-// 			continue
-// 		}
-// 		start := low - rf.lastIncludeIndex
-// 		end := high - rf.lastIncludeIndex
-// 		entries := make([]LogEntry, end-start+1)
-// 		copy(entries, rf.log[start:end+1])
-// 		rf.mu.Unlock()
-// 		for i, entry := range entries {
-// 			rf.applyCh <- raftapi.ApplyMsg{
-// 				CommandValid: true,
-// 				Command:      entry.Command,
-// 				CommandIndex: low + i,
-// 			}
-// 		}
-// 		rf.mu.Lock()
-// 		if high > rf.lastApplied {
-// 			rf.lastApplied = high
-// 		}
-// 		rf.mu.Unlock()
-// 	}
-// }
-
-// func (rf *Raft) applier() {
-// 	for !rf.killed() {
-// 		rf.mu.Lock()
-// 		// 使用 for 而不是 if 配合 Wait
-// 		for rf.commitIndex <= rf.lastApplied {
-// 			rf.cond.Wait()
-// 			if rf.killed() {
-// 				rf.mu.Unlock()
-// 				return
-// 			}
-// 		}
-
-// 		// 确定需要应用的范围
-// 		low := rf.lastApplied + 1
-// 		high := rf.commitIndex
-
-// 		// 关键：防止在快照之后，物理索引计算越界
-// 		if low <= rf.lastIncludeIndex {
-// 			low = rf.lastIncludeIndex + 1
-// 		}
-
-// 		if low > high {
-// 			rf.mu.Unlock()
-// 			continue
-// 		}
-
-// 		// 拷贝日志
-// 		entries := make([]LogEntry, high-low+1)
-// 		copy(entries, rf.log[low-rf.lastIncludeIndex:high-rf.lastIncludeIndex+1])
-// 		rf.mu.Unlock()
-
-// 		// 锁外发送
-// 		for i, entry := range entries {
-// 			rf.applyCh <- raftapi.ApplyMsg{
-// 				CommandValid: true,
-// 				Command:      entry.Command,
-// 				CommandIndex: low + i,
-// 			}
-// 		}
-
-// 		// 发送完再更新 lastApplied
-// 		rf.mu.Lock()
-// 		rf.lastApplied = max(rf.lastApplied, high)
-// 		rf.mu.Unlock()
-// 	}
-// }
-
 func (rf *Raft) applier() {
 	for !rf.killed() {
 		rf.mu.Lock()
-		// 只要没有新提交的日志，且没有待处理的快照，就等待
-		for rf.commitIndex <= rf.lastApplied && !rf.pendingSnapshot {
+		for rf.commitIndex <= rf.lastApplied {
 			rf.cond.Wait()
 			if rf.killed() {
 				rf.mu.Unlock()
 				return
 			}
 		}
-
-		// 1. 优先处理快照（关键：这样保证了快照和日志在 channel 里的顺序）
-		if rf.pendingSnapshot {
-			msg := raftapi.ApplyMsg{
-				SnapshotValid: true,
-				Snapshot:      rf.snapshotData,
-				SnapshotTerm:  rf.lastIncludeTerm,
-				SnapshotIndex: rf.lastIncludeIndex,
-			}
-			rf.pendingSnapshot = false
-			rf.mu.Unlock()
-			rf.applyCh <- msg
-			continue // 处理完快照后重新进入循环检查 commitIndex
+		if rf.lastApplied < rf.lastIncludeIndex {
+			rf.lastApplied = rf.lastIncludeIndex
 		}
-
-		// 2. 处理普通日志
+		if rf.commitIndex <= rf.lastApplied {
+			rf.mu.Unlock()
+			continue
+		}
 		low := rf.lastApplied + 1
 		high := rf.commitIndex
-		if low <= rf.lastIncludeIndex {
-			low = rf.lastIncludeIndex + 1
-		}
-
 		if low > high {
 			rf.mu.Unlock()
 			continue
 		}
-
-		entries := make([]LogEntry, high-low+1)
-		copy(entries, rf.log[low-rf.lastIncludeIndex:])
+		start := low - rf.lastIncludeIndex
+		end := high - rf.lastIncludeIndex
+		entries := make([]LogEntry, end-start+1)
+		copy(entries, rf.log[start:end+1])
 		rf.mu.Unlock()
-
 		for i, entry := range entries {
 			rf.applyCh <- raftapi.ApplyMsg{
 				CommandValid: true,
@@ -887,9 +775,10 @@ func (rf *Raft) applier() {
 				CommandIndex: low + i,
 			}
 		}
-
 		rf.mu.Lock()
-		rf.lastApplied = max(rf.lastApplied, high)
+		if high > rf.lastApplied {
+			rf.lastApplied = high
+		}
 		rf.mu.Unlock()
 	}
 }
