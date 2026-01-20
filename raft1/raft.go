@@ -197,7 +197,10 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	// 3. 更新 snapshot 元数据
 	rf.lastIncludeIndex = args.LastIncludeIndex
 	rf.lastIncludeTerm = args.LastIncludeTerm
-
+	
+	rf.snapshotData = args.Data
+	rf.pendingSnapshot = true
+	
 	// 4. 推进 commitIndex / lastApplied
 	rf.commitIndex = max(rf.commitIndex, rf.lastIncludeIndex)
 	rf.lastApplied = max(rf.lastApplied, rf.lastIncludeIndex)
@@ -217,15 +220,9 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.persister.Save(raftstate, args.Data)
 
 	// 6. 通知上层
-	applymsg := raftapi.ApplyMsg{
-		SnapshotValid: true,
-		Snapshot:      args.Data,
-		SnapshotTerm:  rf.lastIncludeTerm,
-		SnapshotIndex: rf.lastIncludeIndex,
-	}
+	rf.cond.Broadcast()
 	rf.mu.Unlock()
 
-	rf.applyCh <- applymsg
 
 }
 
