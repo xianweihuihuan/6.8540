@@ -6,12 +6,10 @@ package raft
 // Make() 用于创建一个新的 Raft 节点实例，该实例实现了 Raft 接口。
 
 import (
-	//	"bytes"
 	"bytes"
 	//"fmt"
 	"math/rand"
 
-	//"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -20,7 +18,7 @@ import (
 	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raftapi"
-	"6.5840/tester1"
+	tester "6.5840/tester1"
 )
 
 type ServerState int
@@ -64,6 +62,11 @@ type Raft struct {
 
 	lastHeartBeatTime time.Time     // 最后一次接受心跳的时间
 	heartBeatTimeout  time.Duration // 心跳超时时间
+
+	pendingSnap      bool
+	pendingSnapData  []byte
+	pendingSnapIndex int
+	pendingSnapTerm  int
 }
 
 // 返回当前任期（currentTerm）以及该服务器
@@ -137,9 +140,6 @@ func (rf *Raft) readPersist(data []byte) {
 		if rf.lastIncludeIndex > rf.commitIndex {
 			rf.commitIndex = rf.lastIncludeIndex
 		}
-		if rf.lastIncludeIndex > rf.lastApplied {
-			rf.lastApplied = rf.lastIncludeIndex
-		}
 		rf.mu.Unlock()
 	}
 }
@@ -163,11 +163,13 @@ type InstallSnapshotReply struct {
 	Term int
 }
 
+
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
-		rf.mu.Unlock()
 		return
 	}
 	if args.Term > rf.currentTerm {
@@ -175,32 +177,32 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		rf.votedFor = -1
 		rf.persist()
 	}
+
 	rf.state = Follower
 	rf.lastHeartBeatTime = time.Now()
 	reply.Term = rf.currentTerm
-	if args.LastIncludeIndex <= rf.lastApplied || args.LastIncludeIndex <= rf.lastIncludeIndex {
-		rf.mu.Unlock()
+
+	if args.LastIncludeIndex <= rf.lastIncludeIndex {
 		return
 	}
+
 	if args.LastIncludeIndex < rf.lastIncludeIndex+len(rf.log) {
-		rf.log = rf.log[args.LastIncludeIndex-rf.lastIncludeIndex:]
+		cut := args.LastIncludeIndex - rf.lastIncludeIndex
+		if rf.log[cut].Term == args.LastIncludeTerm {
+			rf.log = rf.log[cut:]
+		} else {
+			rf.log = make([]LogEntry, 1)
+		}
 	} else {
 		rf.log = make([]LogEntry, 1)
 	}
+	rf.log[0] = LogEntry{Term: args.LastIncludeTerm, Command: nil}
 
-	// 2. 设置 dummy entry
-	rf.log[0].Term = args.LastIncludeTerm
-	rf.log[0].Command = nil
-
-	// 3. 更新 snapshot 元数据
 	rf.lastIncludeIndex = args.LastIncludeIndex
 	rf.lastIncludeTerm = args.LastIncludeTerm
 
-	// 4. 推进 commitIndex / lastApplied
 	rf.commitIndex = max(rf.commitIndex, rf.lastIncludeIndex)
-	rf.lastApplied = max(rf.lastApplied, rf.lastIncludeIndex)
 
-	// 5. 持久化
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	if e.Encode(rf.currentTerm) != nil ||
@@ -208,21 +210,19 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		e.Encode(rf.log) != nil ||
 		e.Encode(rf.lastIncludeIndex) != nil ||
 		e.Encode(rf.lastIncludeTerm) != nil {
-		rf.mu.Unlock()
 		return
 	}
 	raftstate := w.Bytes()
 	rf.persister.Save(raftstate, args.Data)
 
-	// 6. 通知上层
-	rf.applyCh <- raftapi.ApplyMsg{
-		SnapshotValid: true,
-		Snapshot:      args.Data,
-		SnapshotTerm:  rf.lastIncludeTerm,
-		SnapshotIndex: rf.lastIncludeIndex,
-	}
-	rf.mu.Unlock()
-	
+	snap := make([]byte, len(args.Data))
+	copy(snap, args.Data)
+	rf.pendingSnap = true
+	rf.pendingSnapData = snap
+	rf.pendingSnapIndex = args.LastIncludeIndex
+	rf.pendingSnapTerm = args.LastIncludeTerm
+
+	rf.cond.Broadcast()
 }
 
 // 服务（上层应用）表示它已经创建了一个快照（snapshot），
@@ -231,25 +231,32 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 // Raft 此时应该**尽可能多地裁剪（trim）自己的日志**，
 // 删除 index（含）之前的日志条目。
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
-	// Your code here (3D).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
 	if index <= rf.lastIncludeIndex {
 		return
 	}
-	lastlogindex := rf.lastIncludeIndex + len(rf.log) - 1
-	if index > lastlogindex {
+
+	lastLogIndex := rf.lastIncludeIndex + len(rf.log) - 1
+	if index > lastLogIndex {
 		return
 	}
 
-	newTerm := rf.log[index-rf.lastIncludeIndex].Term
+	cut := index - rf.lastIncludeIndex
+	newTerm := rf.log[cut].Term
 
-	newlog := make([]LogEntry, len(rf.log)+rf.lastIncludeIndex-index)
-	copy(newlog, rf.log[index-rf.lastIncludeIndex:])
-	newlog[0] = LogEntry{Term: newTerm}
+	newlog := make([]LogEntry, len(rf.log)-cut)
+	copy(newlog, rf.log[cut:])
+
+	newlog[0] = LogEntry{Term: newTerm, Command: nil}
+
 	rf.log = newlog
 	rf.lastIncludeIndex = index
 	rf.lastIncludeTerm = newTerm
+
+	rf.commitIndex = max(rf.commitIndex, index)
+	rf.lastApplied = max(rf.lastApplied, index)
 
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
@@ -740,34 +747,58 @@ func (rf *Raft) startElection() {
 	}
 }
 
+
 func (rf *Raft) applier() {
 	for !rf.killed() {
 		rf.mu.Lock()
-		for rf.commitIndex <= rf.lastApplied {
+
+		for rf.commitIndex <= rf.lastApplied && !rf.pendingSnap {
 			rf.cond.Wait()
 			if rf.killed() {
 				rf.mu.Unlock()
 				return
 			}
 		}
-		if rf.lastApplied < rf.lastIncludeIndex {
+
+		if rf.pendingSnap && rf.pendingSnapIndex <= rf.lastApplied {
+			rf.pendingSnap = false
+		}
+
+		if rf.pendingSnap && rf.pendingSnapIndex > rf.lastApplied {
+			msg := raftapi.ApplyMsg{
+				SnapshotValid: true,
+				Snapshot:      rf.pendingSnapData,
+				SnapshotTerm:  rf.pendingSnapTerm,
+				SnapshotIndex: rf.pendingSnapIndex,
+			}
+			rf.pendingSnap = false
+			rf.lastApplied = rf.pendingSnapIndex
+
+			rf.mu.Unlock()
+			rf.applyCh <- msg
+			continue
+		}
+
+		if !rf.pendingSnap && rf.lastApplied < rf.lastIncludeIndex {
 			rf.lastApplied = rf.lastIncludeIndex
 		}
+
 		if rf.commitIndex <= rf.lastApplied {
 			rf.mu.Unlock()
 			continue
 		}
+
 		low := rf.lastApplied + 1
 		high := rf.commitIndex
-		if low > high {
-			rf.mu.Unlock()
-			continue
-		}
+
 		start := low - rf.lastIncludeIndex
 		end := high - rf.lastIncludeIndex
 		entries := make([]LogEntry, end-start+1)
 		copy(entries, rf.log[start:end+1])
+
+		rf.lastApplied = high
 		rf.mu.Unlock()
+
 		for i, entry := range entries {
 			rf.applyCh <- raftapi.ApplyMsg{
 				CommandValid: true,
@@ -775,11 +806,6 @@ func (rf *Raft) applier() {
 				CommandIndex: low + i,
 			}
 		}
-		rf.mu.Lock()
-		if high > rf.lastApplied {
-			rf.lastApplied = high
-		}
-		rf.mu.Unlock()
 	}
 }
 
@@ -815,8 +841,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.readPersist(persister.ReadRaftState())
 	//rf.log[0] = LogEntry{Term: rf.lastIncludeTerm}
 
-	rf.commitIndex = rf.lastIncludeIndex
-	rf.lastApplied = rf.lastIncludeIndex
+	rf.commitIndex = max(rf.commitIndex, rf.lastIncludeIndex)
+
+	if snap := rf.persister.ReadSnapshot(); len(snap) > 0 {
+		rf.pendingSnap = true
+		rf.pendingSnapData = snap
+		rf.pendingSnapIndex = rf.lastIncludeIndex
+		rf.pendingSnapTerm = rf.lastIncludeTerm
+		rf.cond.Broadcast()
+	}
 
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
